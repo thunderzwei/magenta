@@ -1,3 +1,4 @@
+Hello.
 <img src="magenta-logo-bg.png" height="75">
 
 **Magenta** is a research project exploring the role of machine learning

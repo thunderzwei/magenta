@@ -1,4 +1,4 @@
-# Copyright 2019 The Magenta Authors.
+# Copyright 2020 The Magenta Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,24 +13,20 @@
 # limitations under the License.
 
 """MusicVAE data library."""
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import abc
 import collections
 import copy
 import functools
 import itertools
 
-import magenta.music as mm
-from magenta.music import chords_lib
-from magenta.music import drums_encoder_decoder
-from magenta.music import sequences_lib
-from magenta.protobuf import music_pb2
+from magenta.pipelines import drum_pipelines
+from magenta.pipelines import melody_pipelines
+import note_seq
+from note_seq import chords_lib
+from note_seq import drums_encoder_decoder
+from note_seq import sequences_lib
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 import tensorflow_datasets as tfds
 
 PIANO_MIN_MIDI_PITCH = 21
@@ -50,7 +46,12 @@ ELECTRIC_BASS_PROGRAM = 33
 REDUCED_DRUM_PITCH_CLASSES = drums_encoder_decoder.DEFAULT_DRUM_TYPE_PITCHES
 # 61 classes: full General MIDI set
 FULL_DRUM_PITCH_CLASSES = [
-    [p] for c in drums_encoder_decoder.DEFAULT_DRUM_TYPE_PITCHES for p in c]
+    [p] for p in  # pylint:disable=g-complex-comprehension
+    [36, 35, 38, 27, 28, 31, 32, 33, 34, 37, 39, 40, 56, 65, 66, 75, 85, 42, 44,
+     54, 68, 69, 70, 71, 73, 78, 80, 46, 67, 72, 74, 79, 81, 45, 29, 41, 61, 64,
+     84, 48, 47, 60, 63, 77, 86, 87, 50, 30, 43, 62, 76, 83, 49, 55, 57, 58, 51,
+     52, 53, 59, 82]
+]
 ROLAND_DRUM_PITCH_CLASSES = [
     # kick drum
     [36],
@@ -74,7 +75,7 @@ ROLAND_DRUM_PITCH_CLASSES = [
 
 OUTPUT_VELOCITY = 80
 
-CHORD_SYMBOL = music_pb2.NoteSequence.TextAnnotation.CHORD_SYMBOL
+CHORD_SYMBOL = note_seq.NoteSequence.TextAnnotation.CHORD_SYMBOL
 
 
 def _maybe_pad_seqs(seqs, dtype, depth):
@@ -98,6 +99,31 @@ def _extract_instrument(note_sequence, instrument):
   return extracted_ns
 
 
+def maybe_sample_items(seq, sample_size, randomize):
+  """Samples a seq if `sample_size` is provided and less than seq size."""
+  if not sample_size or len(seq) <= sample_size:
+    return seq
+  if randomize:
+    indices = set(np.random.choice(len(seq), size=sample_size, replace=False))
+    return [seq[i] for i in indices]
+  else:
+    return seq[:sample_size]
+
+
+def combine_converter_tensors(converter_tensors, max_num_tensors=None,
+                              randomize_sample=True):
+  """Combines multiple `ConverterTensors` into one and samples if required."""
+  results = []
+  for result in converter_tensors:
+    results.extend(zip(*result))
+  sampled_results = maybe_sample_items(results, max_num_tensors,
+                                       randomize_sample)
+  if sampled_results:
+    return ConverterTensors(*zip(*sampled_results))
+  else:
+    return ConverterTensors()
+
+
 def np_onehot(indices, depth, dtype=np.bool):
   """Converts 1D array of indices to a one-hot 2D array with given depth."""
   onehot_seq = np.zeros((len(indices), depth), dtype=dtype)
@@ -108,7 +134,7 @@ def np_onehot(indices, depth, dtype=np.bool):
 class NoteSequenceAugmenter(object):
   """Class for augmenting NoteSequences.
 
-  Args:
+  Attributes:
     transpose_range: A tuple containing the inclusive, integer range of
         transpose amounts to sample from. If None, no transposition is applied.
     stretch_range: A tuple containing the inclusive, float range of stretch
@@ -146,7 +172,7 @@ class NoteSequenceAugmenter(object):
   def tf_augment(self, note_sequence_scalar):
     """TF op that augments the NoteSequence."""
     def _augment_str(note_sequence_str):
-      note_sequence = music_pb2.NoteSequence.FromString(
+      note_sequence = note_seq.NoteSequence.FromString(
           note_sequence_str.numpy())
       augmented_ns = self.augment(note_sequence)
       return [augmented_ns.SerializeToString()]
@@ -185,21 +211,28 @@ class ConverterTensors(collections.namedtuple(
         cls, inputs, outputs, controls, lengths)
 
 
-class BaseConverter(object):
+class BaseNoteSequenceConverter(object):
   """Base class for data converters between items and tensors.
 
   Inheriting classes must implement the following abstract methods:
-    -`_to_tensors`
-    -`_to_items`
+    -`to_tensors`
+    -`from_tensors`
   """
 
   __metaclass__ = abc.ABCMeta
 
-  def __init__(self, input_depth, input_dtype, output_depth, output_dtype,
-               control_depth=0, control_dtype=np.bool, end_token=None,
-               max_tensors_per_item=None,
-               str_to_item_fn=lambda s: s, length_shape=()):
-    """Initializes BaseConverter.
+  def __init__(self,
+               input_depth,
+               input_dtype,
+               output_depth,
+               output_dtype,
+               control_depth=0,
+               control_dtype=np.bool,
+               end_token=None,
+               max_tensors_per_notesequence=None,
+               length_shape=(),
+               presplit_on_time_changes=True):
+    """Initializes BaseNoteSequenceConverter.
 
     Args:
       input_depth: Depth of final dimension of input (encoder) tensors.
@@ -210,11 +243,11 @@ class BaseConverter(object):
           conditioning on control tensors.
       control_dtype: DType of control tensors.
       end_token: Optional end token.
-      max_tensors_per_item: The maximum number of outputs to return for each
-          input.
-      str_to_item_fn: Callable to convert raw string input into an item for
-          conversion.
+      max_tensors_per_notesequence: The maximum number of outputs to return for
+          each input.
       length_shape: Shape of length returned by `to_tensor`.
+      presplit_on_time_changes: Whether to split NoteSequence on time changes
+        before converting.
     """
     self._input_depth = input_depth
     self._input_dtype = input_dtype
@@ -223,10 +256,11 @@ class BaseConverter(object):
     self._control_depth = control_depth
     self._control_dtype = control_dtype
     self._end_token = end_token
-    self._max_tensors_per_input = max_tensors_per_item
-    self._str_to_item_fn = str_to_item_fn
+    self._max_tensors_per_input = max_tensors_per_notesequence
+    self._str_to_item_fn = note_seq.NoteSequence.FromString
     self._mode = None
     self._length_shape = length_shape
+    self._presplit_on_time_changes = presplit_on_time_changes
 
   def set_mode(self, mode):
     if mode not in ['train', 'eval', 'infer']:
@@ -246,11 +280,11 @@ class BaseConverter(object):
     return self._str_to_item_fn
 
   @property
-  def max_tensors_per_item(self):
+  def max_tensors_per_notesequence(self):
     return self._max_tensors_per_input
 
-  @max_tensors_per_item.setter
-  def max_tensors_per_item(self, value):
+  @max_tensors_per_notesequence.setter
+  def max_tensors_per_notesequence(self, value):
     self._max_tensors_per_input = value
 
   @property
@@ -294,188 +328,14 @@ class BaseConverter(object):
     return self._length_shape
 
   @abc.abstractmethod
-  def _to_tensors(self, item):
-    """Implementation that converts item into encoder/decoder tensors.
-
-    Args:
-     item: Item to convert.
-
-    Returns:
-      A ConverterTensors struct containing encoder inputs, decoder outputs,
-      (optional) control tensors used for both encoding and decoding, and
-      sequence lengths.
-    """
-    pass
-
-  @abc.abstractmethod
-  def _to_items(self, samples, controls=None):
-    """Implementation that decodes model samples into list of items."""
-    pass
-
-  def _maybe_sample_outputs(self, outputs):
-    """If should limit outputs, returns up to limit (randomly if training)."""
-    if (not self.max_tensors_per_item or
-        len(outputs) <= self.max_tensors_per_item):
-      return outputs
-    if self.is_training:
-      indices = set(np.random.choice(
-          len(outputs), size=self.max_tensors_per_item, replace=False))
-      return [outputs[i] for i in indices]
-    else:
-      return outputs[:self.max_tensors_per_item]
-
   def to_tensors(self, item):
-    """Python method that converts `item` into list of tensors."""
-    tensors = self._to_tensors(item)
-    sampled_results = self._maybe_sample_outputs(list(zip(*tensors)))
-    if sampled_results:
-      return ConverterTensors(*zip(*sampled_results))
-    else:
-      return ConverterTensors()
-
-  def _combine_to_tensor_results(self, to_tensor_results):
-    """Combines the results of multiple to_tensors calls into one result."""
-    results = []
-    for result in to_tensor_results:
-      results.extend(zip(*result))
-    sampled_results = self._maybe_sample_outputs(results)
-    if sampled_results:
-      return ConverterTensors(*zip(*sampled_results))
-    else:
-      return ConverterTensors()
-
-  def to_items(self, samples, controls=None):
-    """Python method that decodes samples into list of items."""
-    if controls is None:
-      return self._to_items(samples)
-    else:
-      return self._to_items(samples, controls)
-
-  def tf_to_tensors(self, item_scalar):
-    """TensorFlow op that converts item into output tensors.
-
-    Sequences will be padded to match the length of the longest.
-
-    Args:
-      item_scalar: A scalar of type tf.String containing the raw item to be
-          converted to tensors.
-
-    Returns:
-      inputs: A Tensor, shaped [num encoded seqs, max(lengths), input_depth],
-          containing the padded input encodings.
-      outputs: A Tensor, shaped [num encoded seqs, max(lengths), output_depth],
-          containing the padded output encodings resulting from the input.
-      controls: A Tensor, shaped
-          [num encoded seqs, max(lengths), control_depth], containing the padded
-          control encodings.
-      lengths: A tf.int32 Tensor, shaped [num encoded seqs], containing the
-        unpadded lengths of the tensor sequences resulting from the input.
-    """
-    def _convert_and_pad(item_str):
-      item = self.str_to_item_fn(item_str.numpy())  # pylint:disable=not-callable
-      tensors = self.to_tensors(item)
-      inputs = _maybe_pad_seqs(
-          tensors.inputs, self.input_dtype, self.input_depth)
-      outputs = _maybe_pad_seqs(
-          tensors.outputs, self.output_dtype, self.output_depth)
-      controls = _maybe_pad_seqs(
-          tensors.controls, self.control_dtype, self.control_depth)
-      return inputs, outputs, controls, np.array(tensors.lengths, np.int32)
-    inputs, outputs, controls, lengths = tf.py_function(
-        _convert_and_pad,
-        inp=[item_scalar],
-        Tout=[
-            self.input_dtype, self.output_dtype, self.control_dtype, tf.int32],
-        name='convert_and_pad')
-    inputs.set_shape([None, None, self.input_depth])
-    outputs.set_shape([None, None, self.output_depth])
-    controls.set_shape([None, None, self.control_depth])
-    lengths.set_shape([None] + list(self.length_shape))
-    return inputs, outputs, controls, lengths
-
-
-def preprocess_notesequence(note_sequence, presplit_on_time_changes):
-  """Preprocesses a single NoteSequence, resulting in multiple sequences."""
-  if presplit_on_time_changes:
-    note_sequences = sequences_lib.split_note_sequence_on_time_changes(
-        note_sequence)
-  else:
-    note_sequences = [note_sequence]
-
-  return note_sequences
-
-
-class BaseNoteSequenceConverter(BaseConverter):
-  """Base class for NoteSequence data converters.
-
-  Inheriting classes must implement the following abstract methods:
-    -`_to_tensors`
-    -`_to_notesequences`
-  """
-
-  __metaclass__ = abc.ABCMeta
-
-  def __init__(self, input_depth, input_dtype, output_depth, output_dtype,
-               control_depth=0, control_dtype=np.bool, end_token=None,
-               presplit_on_time_changes=True,
-               max_tensors_per_notesequence=None):
-    """Initializes BaseNoteSequenceConverter.
-
-    Args:
-      input_depth: Depth of final dimension of input (encoder) tensors.
-      input_dtype: DType of input (encoder) tensors.
-      output_depth: Depth of final dimension of output (decoder) tensors.
-      output_dtype: DType of output (decoder) tensors.
-      control_depth: Depth of final dimension of control tensors, or zero if not
-          conditioning on control tensors.
-      control_dtype: DType of control tensors.
-      end_token: Optional end token.
-      presplit_on_time_changes: Whether to split NoteSequence on time changes
-        before converting.
-      max_tensors_per_notesequence: The maximum number of outputs to return
-        for each NoteSequence.
-    """
-    super(BaseNoteSequenceConverter, self).__init__(
-        input_depth, input_dtype, output_depth, output_dtype,
-        control_depth, control_dtype, end_token,
-        max_tensors_per_item=max_tensors_per_notesequence,
-        str_to_item_fn=music_pb2.NoteSequence.FromString)
-
-    self._presplit_on_time_changes = presplit_on_time_changes
-
-  @property
-  def max_tensors_per_notesequence(self):
-    return self.max_tensors_per_item
-
-  @max_tensors_per_notesequence.setter
-  def max_tensors_per_notesequence(self, value):
-    self.max_tensors_per_item = value
-
-  @abc.abstractmethod
-  def _to_notesequences(self, samples, controls=None):
-    """Implementation that decodes model samples into list of NoteSequences."""
+    """Python method that converts `item` into list of `ConverterTensors`."""
     pass
 
-  def to_notesequences(self, samples, controls=None):
-    """Python method that decodes samples into list of NoteSequences."""
-    return self._to_items(samples, controls)
-
-  def to_tensors(self, note_sequence):
-    """Python method that converts `note_sequence` into list of tensors."""
-    note_sequences = preprocess_notesequence(
-        note_sequence, self._presplit_on_time_changes)
-
-    results = []
-    for ns in note_sequences:
-      results.append(super(BaseNoteSequenceConverter, self).to_tensors(ns))
-    return self._combine_to_tensor_results(results)
-
-  def _to_items(self, samples, controls=None):
-    """Python method that decodes samples into list of NoteSequences."""
-    if controls is None:
-      return self._to_notesequences(samples)
-    else:
-      return self._to_notesequences(samples, controls)
+  @abc.abstractmethod
+  def from_tensors(self, samples, controls=None):
+    """Python method that decodes model samples into list of items."""
+    pass
 
 
 class LegacyEventListOneHotConverter(BaseNoteSequenceConverter):
@@ -485,7 +345,7 @@ class LegacyEventListOneHotConverter(BaseNoteSequenceConverter):
   uniquifies, and converts to encoding. Uses the OneHotEncoding's
   output encoding for both the input and output.
 
-  Args:
+  Attributes:
     event_list_fn: A function that returns a new EventSequence.
     event_extractor_fn: A function for extracing events into EventSequences. The
       sole input should be the quantized NoteSequence.
@@ -507,6 +367,10 @@ class LegacyEventListOneHotConverter(BaseNoteSequenceConverter):
       before converting.
     chord_encoding: An instantiated OneHotEncoding object to use for encoding
       chords on which to condition, or None if not conditioning on chords.
+    condition_on_key: If True, condition on key; key is represented as a
+      depth-12 one-hot encoding.
+    dedupe_event_lists: If True, only keep unique events in the extracted
+      event list.
   """
 
   def __init__(self, event_list_fn, event_extractor_fn,
@@ -514,7 +378,8 @@ class LegacyEventListOneHotConverter(BaseNoteSequenceConverter):
                slice_steps=None, steps_per_quarter=None, steps_per_second=None,
                quarters_per_bar=4, pad_to_total_time=False,
                max_tensors_per_notesequence=None,
-               presplit_on_time_changes=True, chord_encoding=None):
+               presplit_on_time_changes=True, chord_encoding=None,
+               condition_on_key=False, dedupe_event_lists=True):
     if (steps_per_quarter, steps_per_second).count(None) != 1:
       raise ValueError(
           'Exactly one of `steps_per_quarter` and `steps_per_second` should be '
@@ -526,6 +391,7 @@ class LegacyEventListOneHotConverter(BaseNoteSequenceConverter):
     self._event_extractor_fn = event_extractor_fn
     self._legacy_encoder_decoder = legacy_encoder_decoder
     self._chord_encoding = chord_encoding
+    self._condition_on_key = condition_on_key
     self._steps_per_quarter = steps_per_quarter
     if steps_per_quarter:
       self._steps_per_bar = steps_per_quarter * quarters_per_bar
@@ -535,10 +401,14 @@ class LegacyEventListOneHotConverter(BaseNoteSequenceConverter):
     else:
       self._slice_steps = slice_steps
     self._pad_to_total_time = pad_to_total_time
+    self._dedupe_event_lists = dedupe_event_lists
 
     depth = legacy_encoder_decoder.num_classes + add_end_token
     control_depth = (
-        chord_encoding.num_classes if chord_encoding is not None else 0)
+        chord_encoding.num_classes if chord_encoding is not None else 0
+    ) + (
+        12 if condition_on_key else 0
+    )
     super(LegacyEventListOneHotConverter, self).__init__(
         input_depth=depth,
         input_dtype=np.bool,
@@ -550,30 +420,133 @@ class LegacyEventListOneHotConverter(BaseNoteSequenceConverter):
         presplit_on_time_changes=presplit_on_time_changes,
         max_tensors_per_notesequence=max_tensors_per_notesequence)
 
-  def _to_tensors(self, note_sequence):
+  def _dedupe_and_sample(self, all_sliced_lists):
+    """Dedupe lists of events, chords, and keys, then optionally sample."""
+    # This function expects the following lists (when chords & keys are present;
+    # when absent those lists will simply be missing):
+    #
+    # all_sliced_lists = [
+    #   [
+    #     [event_00, event_01, ..., event_0a],
+    #     [event_10, event_11, ..., event_1b],
+    #     [event_20, event_21, ..., event_2c]
+    #   ],
+    #   [
+    #     [chord_00, chord_01, ..., chord_0a],
+    #     [chord_10, chord_11, ..., chord_1b],
+    #     [chord_20, chord_21, ..., chord_2c]
+    #   ],
+    #   [
+    #     [key_00, key_01, ..., key_0a],
+    #     [key_10, key_11, ..., key_1b],
+    #     [key_20, key_21, ..., key_2c]
+    #   ]
+    # ]
+
+    sliced_multievent_lists = [zip(*lists) for lists in zip(*all_sliced_lists)]
+
+    # Now we have:
+    #
+    # sliced_multievent_lists = [
+    #   [(event_00, chord_00, key_00), ..., (event_0a, chord_0a, key_0a)],
+    #   [(event_10, chord_10, key_10), ..., (event_1b, chord_1b, key_1b)],
+    #   [(event_20, chord_20, key_20), ..., (event_2c, chord_2c, key_2c)]
+    # ]
+
+    # TODO(adarob): Consider handling the fact that different event lists can
+    # be mapped to identical tensors by the encoder_decoder (e.g., Drums).
+
+    if self._dedupe_event_lists:
+      multievent_tuples = list(
+          set(tuple(l) for l in sliced_multievent_lists))
+    else:
+      multievent_tuples = [tuple(l) for l in sliced_multievent_lists]
+    multievent_tuples = maybe_sample_items(
+        multievent_tuples,
+        self.max_tensors_per_notesequence,
+        self.is_training)
+
+    # Now multievent_tuples is structured like sliced_multievent_lists
+    # above, with duplicates optionally removed and sampled.
+
+    if multievent_tuples:
+      # Return lists structured like input all_sliced_lists.
+      return list(zip(*[zip(*t) for t in multievent_tuples if t]))
+    else:
+      return []
+
+  def _chords_and_keys_to_controls(self, chord_tuples, key_tuples):
+    """Map chord and/or key tuples to control tensors."""
+    control_seqs = []
+
+    # Use zip_longest here because chord_tuples and key_tuples should either be:
+    #   a) a list of tuples, with chord_tuples and key_tuples the same shape
+    #   b) the empty list
+    for ct, kt in itertools.zip_longest(chord_tuples, key_tuples):
+      controls = []
+
+      if ct is not None:
+        try:
+          chord_tokens = [self._chord_encoding.encode_event(e) for e in ct]
+          if self.end_token:
+            # Repeat the last chord instead of using a special token;
+            # otherwise the model may learn to rely on the special token to
+            # detect endings.
+            if chord_tokens:
+              chord_tokens.append(chord_tokens[-1])
+            else:
+              chord_tokens.append(
+                  self._chord_encoding.encode_event(note_seq.NO_CHORD))
+        except (note_seq.ChordSymbolError, note_seq.ChordEncodingError):
+          return []
+        controls.append(np_onehot(
+            chord_tokens, self._chord_encoding.num_classes,
+            self.control_dtype))
+
+      if kt is not None:
+        if self.end_token:
+          # Repeat the last key. If the sequence is empty, just pick randomly.
+          if kt:
+            kt.append(kt[-1])
+          else:
+            kt.append(np.random.choice(range(12)))
+        controls.append(np_onehot(kt, 12, self.control_dtype))
+
+      # Concatenate controls (chord and/or key) depthwise. The resulting control
+      # tensor should be one of:
+      #   a) a one-hot-encoded chord (if not conditioning on key)
+      #   b) a one-hot-encoded key (if not conditioning on chord)
+      #   c) both (a) and (b), concatenated depthwise
+      control_seqs.append(np.concatenate(controls, axis=1))
+
+    return control_seqs
+
+  def to_tensors(self, note_sequence):
     """Converts NoteSequence to unique, one-hot tensor sequences."""
     try:
       if self._steps_per_quarter:
-        quantized_sequence = mm.quantize_note_sequence(
+        quantized_sequence = note_seq.quantize_note_sequence(
             note_sequence, self._steps_per_quarter)
-        if (mm.steps_per_bar_in_quantized_sequence(quantized_sequence) !=
+        if (note_seq.steps_per_bar_in_quantized_sequence(quantized_sequence) !=
             self._steps_per_bar):
           return ConverterTensors()
       else:
-        quantized_sequence = mm.quantize_note_sequence_absolute(
+        quantized_sequence = note_seq.quantize_note_sequence_absolute(
             note_sequence, self._steps_per_second)
-    except (mm.BadTimeSignatureError, mm.NonIntegerStepsPerBarError,
-            mm.NegativeTimeError) as e:
+    except (note_seq.BadTimeSignatureError, note_seq.NonIntegerStepsPerBarError,
+            note_seq.NegativeTimeError) as e:
       return ConverterTensors()
 
-    if self._chord_encoding and not any(
+    if (self._chord_encoding and not any(
         ta.annotation_type == CHORD_SYMBOL
-        for ta in quantized_sequence.text_annotations):
-      # We are conditioning on chords but sequence does not have chords. Try to
-      # infer them.
+        for ta in quantized_sequence.text_annotations)) or (
+            self._condition_on_key and not quantized_sequence.key_signatures):
+      # We are conditioning on chords and/or key but sequence does not have
+      # them. Try to infer chords and optionally key.
       try:
-        mm.infer_chords_for_sequence(quantized_sequence)
-      except mm.ChordInferenceError:
+        note_seq.infer_chords_for_sequence(
+            quantized_sequence, add_key_signatures=self._condition_on_key)
+      except note_seq.ChordInferenceError:
         return ConverterTensors()
 
     event_lists, unused_stats = self._event_extractor_fn(quantized_sequence)
@@ -589,44 +562,49 @@ class LegacyEventListOneHotConverter(BaseNoteSequenceConverter):
     else:
       sliced_event_lists = event_lists
 
+    # We are going to dedupe the event lists. However, when conditioning on
+    # chords and/or key, we want to include the same event list multiple times
+    # if it appears with different chords or keys.
+    all_sliced_lists = [sliced_event_lists]
+
     if self._chord_encoding:
+      # Extract chord lists that correspond to event lists, i.e. for each event
+      # we find the chord active at that time step.
       try:
         sliced_chord_lists = chords_lib.event_list_chords(
             quantized_sequence, sliced_event_lists)
       except chords_lib.CoincidentChordsError:
         return ConverterTensors()
-      sliced_event_lists = [zip(el, cl) for el, cl in zip(sliced_event_lists,
-                                                          sliced_chord_lists)]
+      all_sliced_lists.append(sliced_chord_lists)
 
-    # TODO(adarob): Consider handling the fact that different event lists can
-    # be mapped to identical tensors by the encoder_decoder (e.g., Drums).
+    if self._condition_on_key:
+      # Extract key lists that correspond to event lists, i.e. for each event
+      # we find the key active at that time step.
+      if self._steps_per_second:
+        steps_per_second = self._steps_per_second
+      else:
+        qpm = quantized_sequence.tempos[0].qpm
+        steps_per_second = self._steps_per_quarter * qpm / 60.0
+      sliced_key_lists = chords_lib.event_list_keys(
+          quantized_sequence, sliced_event_lists, steps_per_second)
+      all_sliced_lists.append(sliced_key_lists)
 
-    unique_event_tuples = list(set(tuple(l) for l in sliced_event_lists))
-    unique_event_tuples = self._maybe_sample_outputs(unique_event_tuples)
-
-    if not unique_event_tuples:
+    all_unique_tuples = self._dedupe_and_sample(all_sliced_lists)
+    if not all_unique_tuples:
       return ConverterTensors()
 
-    control_seqs = []
-    if self._chord_encoding:
-      unique_event_tuples, unique_chord_tuples = zip(
-          *[zip(*t) for t in unique_event_tuples if t])
-      for t in unique_chord_tuples:
-        try:
-          chord_tokens = [self._chord_encoding.encode_event(e) for e in t]
-          if self.end_token:
-            # Repeat the last chord instead of using a special token; otherwise
-            # the model may learn to rely on the special token to detect
-            # endings.
-            if chord_tokens:
-              chord_tokens.append(chord_tokens[-1])
-            else:
-              chord_tokens.append(
-                  self._chord_encoding.encode_event(mm.NO_CHORD))
-        except (mm.ChordSymbolError, mm.ChordEncodingError):
-          return ConverterTensors()
-        control_seqs.append(
-            np_onehot(chord_tokens, self.control_depth, self.control_dtype))
+    unique_event_tuples = all_unique_tuples[0]
+    unique_chord_tuples = all_unique_tuples[1] if self._chord_encoding else []
+    unique_key_tuples = all_unique_tuples[-1] if self._condition_on_key else []
+
+    if self._chord_encoding or self._condition_on_key:
+      # We need to encode control sequences consisting of chords and/or keys.
+      control_seqs = self._chords_and_keys_to_controls(
+          unique_chord_tuples, unique_key_tuples)
+      if not control_seqs:
+        return ConverterTensors()
+    else:
+      control_seqs = []
 
     seqs = []
     for t in unique_event_tuples:
@@ -637,7 +615,8 @@ class LegacyEventListOneHotConverter(BaseNoteSequenceConverter):
 
     return ConverterTensors(inputs=seqs, outputs=seqs, controls=control_seqs)
 
-  def _to_notesequences(self, samples, controls=None):
+  def from_tensors(self, samples, controls=None):
+    """Converts model samples to a list of `NoteSequence`s."""
     output_sequences = []
     for i, sample in enumerate(samples):
       s = np.argmax(sample, axis=-1)
@@ -651,7 +630,7 @@ class LegacyEventListOneHotConverter(BaseNoteSequenceConverter):
         assert e != self.end_token
         event_list.append(self._legacy_encoder_decoder.decode_event(e))
       if self._steps_per_quarter:
-        qpm = mm.DEFAULT_QUARTERS_PER_MINUTE
+        qpm = note_seq.DEFAULT_QUARTERS_PER_MINUTE
         seconds_per_step = 60.0 / (self._steps_per_quarter * qpm)
         sequence = event_list.to_sequence(velocity=OUTPUT_VELOCITY, qpm=qpm)
       else:
@@ -659,9 +638,13 @@ class LegacyEventListOneHotConverter(BaseNoteSequenceConverter):
         sequence = event_list.to_sequence(velocity=OUTPUT_VELOCITY)
       if self._chord_encoding and controls is not None:
         chords = [self._chord_encoding.decode_event(e)
-                  for e in np.argmax(controls[i], axis=-1)[:end_index]]
+                  for e in np.argmax(controls[i][:, :-12], axis=-1)[:end_index]]
         chord_times = [step * seconds_per_step for step in event_list.steps]
         chords_lib.add_chords_to_sequence(sequence, chords, chord_times)
+      if self._condition_on_key and controls is not None:
+        keys = np.argmax(controls[i][:, -12:], axis=-1)[:end_index]
+        key_times = [step * seconds_per_step for step in event_list.steps]
+        chords_lib.add_keys_to_sequence(sequence, keys, key_times)
       output_sequences.append(sequence)
     return output_sequences
 
@@ -669,29 +652,10 @@ class LegacyEventListOneHotConverter(BaseNoteSequenceConverter):
 class OneHotMelodyConverter(LegacyEventListOneHotConverter):
   """Converter for legacy MelodyOneHotEncoding.
 
-  Args:
-    min_pitch: The minimum pitch to model. Those below this value will be
-      ignored.
-    max_pitch: The maximum pitch to model. Those above this value will be
-      ignored.
-    valid_programs: Optional set of program numbers to allow.
-    skip_polyphony: Whether to skip polyphonic instruments. If False, the
-      highest pitch will be taken in polyphonic sections.
-    max_bars: Optional maximum number of bars per extracted melody, before
-      slicing.
-    slice_bars: Optional size of window to slide over raw Melodies after
-      extraction.
-    gap_bars: If this many bars or more of non-events follow a note event, the
-       melody is ended. Disabled when set to 0 or None.
-    steps_per_quarter: The number of quantization steps per quarter note.
-    quarters_per_bar: The number of quarter notes per bar.
-    pad_to_total_time: Pads each input/output tensor to the total time of the
-      NoteSequence.
-    add_end_token: Whether to add an end token at the end of each sequence.
-    max_tensors_per_notesequence: The maximum number of outputs to return
-      for each NoteSequence.
-    chord_encoding: An instantiated OneHotEncoding object to use for encoding
-      chords on which to condition, or None if not conditioning on chords.
+  Attributes:
+    melody_fn: A function that takes no arguments and returns an empty Melody.
+    melody_encoding: The MelodyOneHotEncoding object used to encode/decode
+        individual melody events.
   """
 
   def __init__(self, min_pitch=PIANO_MIN_MIDI_PITCH,
@@ -700,7 +664,40 @@ class OneHotMelodyConverter(LegacyEventListOneHotConverter):
                gap_bars=1.0, steps_per_quarter=4, quarters_per_bar=4,
                add_end_token=False, pad_to_total_time=False,
                max_tensors_per_notesequence=5, presplit_on_time_changes=True,
-               chord_encoding=None):
+               chord_encoding=None, condition_on_key=False,
+               dedupe_event_lists=True):
+    """Initialize a OneHotMelodyConverter object.
+
+    Args:
+      min_pitch: The minimum pitch to model. Those below this value will be
+          ignored.
+      max_pitch: The maximum pitch to model. Those above this value will be
+          ignored.
+      valid_programs: Optional set of program numbers to allow.
+      skip_polyphony: Whether to skip polyphonic instruments. If False, the
+          highest pitch will be taken in polyphonic sections.
+      max_bars: Optional maximum number of bars per extracted melody, before
+          slicing.
+      slice_bars: Optional size of window to slide over raw Melodies after
+          extraction.
+      gap_bars: If this many bars or more of non-events follow a note event, the
+          melody is ended. Disabled when set to 0 or None.
+      steps_per_quarter: The number of quantization steps per quarter note.
+      quarters_per_bar: The number of quarter notes per bar.
+      add_end_token: Whether to add an end token at the end of each sequence.
+      pad_to_total_time: Pads each input/output tensor to the total time of the
+          NoteSequence.
+      max_tensors_per_notesequence: The maximum number of outputs to return
+          for each NoteSequence.
+      presplit_on_time_changes: Whether to split NoteSequence on time changes
+          before converting.
+      chord_encoding: An instantiated OneHotEncoding object to use for encoding
+          chords on which to condition, or None if not conditioning on chords.
+      condition_on_key: If True, condition on key; key is represented as a
+          depth-12 one-hot encoding.
+      dedupe_event_lists: If True, only keep unique events in the extracted
+          event list.
+    """
     self._min_pitch = min_pitch
     self._max_pitch = max_pitch
     self._valid_programs = valid_programs
@@ -708,10 +705,15 @@ class OneHotMelodyConverter(LegacyEventListOneHotConverter):
     max_steps_truncate = steps_per_bar * max_bars if max_bars else None
 
     def melody_fn():
-      return mm.Melody(
+      return note_seq.Melody(
           steps_per_bar=steps_per_bar, steps_per_quarter=steps_per_quarter)
+
+    self._melody_fn = melody_fn
+    self._melody_encoding = note_seq.MelodyOneHotEncoding(
+        min_pitch, max_pitch + 1)
+
     melody_extractor_fn = functools.partial(
-        mm.extract_melodies,
+        melody_pipelines.extract_melodies,
         min_bars=1,
         gap_bars=gap_bars or float('inf'),
         max_steps_truncate=max_steps_truncate,
@@ -721,7 +723,7 @@ class OneHotMelodyConverter(LegacyEventListOneHotConverter):
     super(OneHotMelodyConverter, self).__init__(
         melody_fn,
         melody_extractor_fn,
-        mm.MelodyOneHotEncoding(min_pitch, max_pitch + 1),
+        self._melody_encoding,
         add_end_token=add_end_token,
         slice_bars=slice_bars,
         pad_to_total_time=pad_to_total_time,
@@ -729,9 +731,19 @@ class OneHotMelodyConverter(LegacyEventListOneHotConverter):
         quarters_per_bar=quarters_per_bar,
         max_tensors_per_notesequence=max_tensors_per_notesequence,
         presplit_on_time_changes=presplit_on_time_changes,
-        chord_encoding=chord_encoding)
+        chord_encoding=chord_encoding,
+        condition_on_key=condition_on_key,
+        dedupe_event_lists=dedupe_event_lists)
 
-  def _to_tensors(self, note_sequence):
+  @property
+  def melody_fn(self):
+    return self._melody_fn
+
+  @property
+  def melody_encoding(self):
+    return self._melody_encoding
+
+  def _to_tensors_fn(self, note_sequence):
     def is_valid(note):
       if (self._valid_programs is not None and
           note.program not in self._valid_programs):
@@ -740,7 +752,13 @@ class OneHotMelodyConverter(LegacyEventListOneHotConverter):
     notes = list(note_sequence.notes)
     del note_sequence.notes[:]
     note_sequence.notes.extend([n for n in notes if is_valid(n)])
-    return super(OneHotMelodyConverter, self)._to_tensors(note_sequence)
+    return super(OneHotMelodyConverter, self).to_tensors(note_sequence)
+
+  def to_tensors(self, note_sequence):
+    return split_process_and_combine(note_sequence,
+                                     self._presplit_on_time_changes,
+                                     self.max_tensors_per_notesequence,
+                                     self.is_training, self._to_tensors_fn)
 
 
 class DrumsConverter(BaseNoteSequenceConverter):
@@ -752,7 +770,7 @@ class DrumsConverter(BaseNoteSequenceConverter):
   The "roll" input encoding includes a final NOR bit (after the optional end
   token).
 
-  Args:
+  Attributes:
     max_bars: Optional maximum number of bars per extracted drums, before
       slicing.
     slice_bars: Optional size of window to slide over raw Melodies after
@@ -784,9 +802,9 @@ class DrumsConverter(BaseNoteSequenceConverter):
                roll_output=False, max_tensors_per_notesequence=5,
                presplit_on_time_changes=True):
     self._pitch_classes = pitch_classes or REDUCED_DRUM_PITCH_CLASSES
-    self._pitch_class_map = {
-        p: i for i, pitches in enumerate(self._pitch_classes) for p in pitches}
-
+    self._pitch_class_map = {}
+    for i, pitches in enumerate(self._pitch_classes):
+      self._pitch_class_map.update({p: i for p in pitches})
     self._steps_per_quarter = steps_per_quarter
     self._steps_per_bar = steps_per_quarter * quarters_per_bar
     self._slice_steps = self._steps_per_bar * slice_bars if slice_bars else None
@@ -795,7 +813,7 @@ class DrumsConverter(BaseNoteSequenceConverter):
     self._roll_output = roll_output
 
     self._drums_extractor_fn = functools.partial(
-        mm.extract_drum_tracks,
+        drum_pipelines.extract_drum_tracks,
         min_bars=1,
         gap_bars=gap_bars or float('inf'),
         max_steps_truncate=self._steps_per_bar * max_bars if max_bars else None,
@@ -803,11 +821,11 @@ class DrumsConverter(BaseNoteSequenceConverter):
 
     num_classes = len(self._pitch_classes)
 
-    self._pr_encoder_decoder = mm.PianorollEncoderDecoder(
+    self._pr_encoder_decoder = note_seq.PianorollEncoderDecoder(
         input_size=num_classes + add_end_token)
     # Use pitch classes as `drum_type_pitches` since we have already done the
     # mapping.
-    self._oh_encoder_decoder = mm.MultiDrumOneHotEncoding(
+    self._oh_encoder_decoder = note_seq.MultiDrumOneHotEncoding(
         drum_type_pitches=[(i,) for i in range(num_classes)])
 
     if self._roll_output:
@@ -829,16 +847,16 @@ class DrumsConverter(BaseNoteSequenceConverter):
         presplit_on_time_changes=presplit_on_time_changes,
         max_tensors_per_notesequence=max_tensors_per_notesequence)
 
-  def _to_tensors(self, note_sequence):
+  def _to_tensors_fn(self, note_sequence):
     """Converts NoteSequence to unique sequences."""
     try:
-      quantized_sequence = mm.quantize_note_sequence(
+      quantized_sequence = note_seq.quantize_note_sequence(
           note_sequence, self._steps_per_quarter)
-      if (mm.steps_per_bar_in_quantized_sequence(quantized_sequence) !=
+      if (note_seq.steps_per_bar_in_quantized_sequence(quantized_sequence) !=
           self._steps_per_bar):
         return ConverterTensors()
-    except (mm.BadTimeSignatureError, mm.NonIntegerStepsPerBarError,
-            mm.NegativeTimeError) as e:
+    except (note_seq.BadTimeSignatureError, note_seq.NonIntegerStepsPerBarError,
+            note_seq.NegativeTimeError) as e:
       return ConverterTensors()
 
     new_notes = []
@@ -867,7 +885,9 @@ class DrumsConverter(BaseNoteSequenceConverter):
       sliced_event_tuples = [tuple(l) for l in event_lists]
 
     unique_event_tuples = list(set(sliced_event_tuples))
-    unique_event_tuples = self._maybe_sample_outputs(unique_event_tuples)
+    unique_event_tuples = maybe_sample_items(unique_event_tuples,
+                                             self.max_tensors_per_notesequence,
+                                             self.is_training)
 
     rolls = []
     oh_vecs = []
@@ -900,7 +920,13 @@ class DrumsConverter(BaseNoteSequenceConverter):
 
     return ConverterTensors(inputs=input_seqs, outputs=output_seqs)
 
-  def _to_notesequences(self, samples):
+  def to_tensors(self, note_sequence):
+    return split_process_and_combine(note_sequence,
+                                     self._presplit_on_time_changes,
+                                     self.max_tensors_per_notesequence,
+                                     self.is_training, self._to_tensors_fn)
+
+  def from_tensors(self, samples, unused_controls=None):
     output_sequences = []
     for s in samples:
       if self._roll_output:
@@ -917,8 +943,9 @@ class DrumsConverter(BaseNoteSequenceConverter):
       # Map classes to exemplars.
       events_list = [
           frozenset(self._pitch_classes[c][0] for c in e) for e in events_list]
-      track = mm.DrumTrack(
-          events=events_list, steps_per_bar=self._steps_per_bar,
+      track = note_seq.DrumTrack(
+          events=events_list,
+          steps_per_bar=self._steps_per_bar,
           steps_per_quarter=self._steps_per_quarter)
       output_sequences.append(track.to_sequence(velocity=OUTPUT_VELOCITY))
     return output_sequences
@@ -932,7 +959,7 @@ class TrioConverter(BaseNoteSequenceConverter):
   and OneHotDrumsConverter. Takes the cross products from the sets of
   instruments of each type.
 
-  Args:
+  Attributes:
     slice_bars: Optional size of window to slide over full converted tensor.
     gap_bars: The number of consecutive empty bars to allow for any given
       instrument. Note that this number is effectively doubled for internal
@@ -993,15 +1020,16 @@ class TrioConverter(BaseNoteSequenceConverter):
         presplit_on_time_changes=True,
         max_tensors_per_notesequence=max_tensors_per_notesequence)
 
-  def _to_tensors(self, note_sequence):
+  def _to_tensors_fn(self, note_sequence):
+    """Converts a `NoteSequence` to `ConverterTensors` obj."""
     try:
-      quantized_sequence = mm.quantize_note_sequence(
+      quantized_sequence = note_seq.quantize_note_sequence(
           note_sequence, self._steps_per_quarter)
-      if (mm.steps_per_bar_in_quantized_sequence(quantized_sequence) !=
+      if (note_seq.steps_per_bar_in_quantized_sequence(quantized_sequence) !=
           self._steps_per_bar):
         return ConverterTensors()
-    except (mm.BadTimeSignatureError, mm.NonIntegerStepsPerBarError,
-            mm.NegativeTimeError):
+    except (note_seq.BadTimeSignatureError, note_seq.NonIntegerStepsPerBarError,
+            note_seq.NegativeTimeError):
       return ConverterTensors()
 
     if self._chord_encoding and not any(
@@ -1010,8 +1038,8 @@ class TrioConverter(BaseNoteSequenceConverter):
       # We are conditioning on chords but sequence does not have chords. Try to
       # infer them.
       try:
-        mm.infer_chords_for_sequence(quantized_sequence)
-      except mm.ChordInferenceError:
+        note_seq.infer_chords_for_sequence(quantized_sequence)
+      except note_seq.ChordInferenceError:
         return ConverterTensors()
 
       # The trio parts get extracted from the original NoteSequence, so copy the
@@ -1124,16 +1152,22 @@ class TrioConverter(BaseNoteSequenceConverter):
 
     return ConverterTensors(inputs=seqs, outputs=seqs, controls=control_seqs)
 
-  def _to_notesequences(self, samples, controls=None):
+  def to_tensors(self, note_sequence):
+    return split_process_and_combine(note_sequence,
+                                     self._presplit_on_time_changes,
+                                     self.max_tensors_per_notesequence,
+                                     self.is_training, self._to_tensors_fn)
+
+  def from_tensors(self, samples, controls=None):
     output_sequences = []
     dim_ranges = np.cumsum(self._split_output_depths)
     for i, s in enumerate(samples):
-      mel_ns = self._melody_converter.to_notesequences(
+      mel_ns = self._melody_converter.from_tensors(
           [s[:, :dim_ranges[0]]],
           [controls[i]] if controls is not None else None)[0]
-      bass_ns = self._melody_converter.to_notesequences(
+      bass_ns = self._melody_converter.from_tensors(
           [s[:, dim_ranges[0]:dim_ranges[1]]])[0]
-      drums_ns = self._drums_converter.to_notesequences(
+      drums_ns = self._drums_converter.from_tensors(
           [s[:, dim_ranges[1]:]])[0]
 
       for n in bass_ns.notes:
@@ -1149,125 +1183,6 @@ class TrioConverter(BaseNoteSequenceConverter):
           mel_ns.total_time, bass_ns.total_time, drums_ns.total_time)
       output_sequences.append(ns)
     return output_sequences
-
-
-def count_examples(examples_path, tfds_name, data_converter,
-                   file_reader=tf.python_io.tf_record_iterator):
-  """Counts the number of examples produced by the converter from files."""
-  def _file_generator():
-    filenames = tf.gfile.Glob(examples_path)
-    for f in filenames:
-      tf.logging.info('Counting examples in %s.', f)
-      reader = file_reader(f)
-      for item_str in reader:
-        yield data_converter.str_to_item_fn(item_str)
-
-  def _tfds_generator():
-    ds = tfds.as_numpy(
-        tfds.load(tfds_name, split=tfds.Split.VALIDATION, try_gcs=True))
-    # TODO(adarob): Generalize to other data types if needed.
-    for ex in ds:
-      yield mm.midi_to_note_sequence(ex['midi'])
-
-  num_examples = 0
-
-  generator = _tfds_generator if tfds_name else _file_generator
-  for item in generator():
-    tensors = data_converter.to_tensors(item)
-    num_examples += len(tensors.inputs)
-  tf.logging.info('Total examples: %d', num_examples)
-  return num_examples
-
-
-def get_dataset(
-    config,
-    num_threads=1,
-    tf_file_reader=tf.data.TFRecordDataset,
-    is_training=False,
-    cache_dataset=True):
-  """Get input tensors from dataset for training or evaluation.
-
-  Args:
-    config: A Config object containing dataset information.
-    num_threads: The number of threads to use for pre-processing.
-    tf_file_reader: The tf.data.Dataset class to use for reading files.
-    is_training: Whether or not the dataset is used in training. Determines
-      whether dataset is shuffled and repeated, etc.
-    cache_dataset: Whether to cache the dataset in memory for improved
-      performance.
-
-  Returns:
-    A tf.data.Dataset containing input, output, control, and length tensors.
-
-  Raises:
-    ValueError: If no files match examples path.
-  """
-  batch_size = config.hparams.batch_size
-  examples_path = (
-      config.train_examples_path if is_training else config.eval_examples_path)
-  note_sequence_augmenter = (
-      config.note_sequence_augmenter if is_training else None)
-  data_converter = config.data_converter
-  data_converter.set_mode('train' if is_training else 'eval')
-
-  if examples_path:
-    tf.logging.info('Reading examples from file: %s', examples_path)
-    num_files = len(tf.gfile.Glob(examples_path))
-    if not num_files:
-      raise ValueError(
-          'No files were found matching examples path: %s' %  examples_path)
-    files = tf.data.Dataset.list_files(examples_path)
-    dataset = files.apply(
-        tf.contrib.data.parallel_interleave(
-            tf_file_reader,
-            cycle_length=num_threads,
-            sloppy=is_training))
-  elif config.tfds_name:
-    tf.logging.info('Reading examples from TFDS: %s', config.tfds_name)
-    dataset = tfds.load(
-        config.tfds_name,
-        split=tfds.Split.TRAIN if is_training else tfds.Split.VALIDATION,
-        try_gcs=True)
-    def _tf_midi_to_note_sequence(ex):
-      return tf.py_function(
-          lambda x: [mm.midi_to_note_sequence(x.numpy()).SerializeToString()],
-          inp=[ex['midi']],
-          Tout=tf.string,
-          name='midi_to_note_sequence')
-    dataset = dataset.map(
-        _tf_midi_to_note_sequence,
-        num_parallel_calls=tf.data.experimental.AUTOTUNE)
-  else:
-    raise ValueError(
-        'One of `config.examples_path` or `config.tfds_name` must be defined.')
-
-  def _remove_pad_fn(padded_seq_1, padded_seq_2, padded_seq_3, length):
-    if length.shape.ndims == 0:
-      return (padded_seq_1[0:length], padded_seq_2[0:length],
-              padded_seq_3[0:length], length)
-    else:
-      # Don't remove padding for hierarchical examples.
-      return padded_seq_1, padded_seq_2, padded_seq_3, length
-
-  if note_sequence_augmenter is not None:
-    dataset = dataset.map(note_sequence_augmenter.tf_augment)
-  dataset = (dataset
-             .map(data_converter.tf_to_tensors,
-                  num_parallel_calls=tf.data.experimental.AUTOTUNE)
-             .flat_map(lambda *t: tf.data.Dataset.from_tensor_slices(t))
-             .map(_remove_pad_fn,
-                  num_parallel_calls=tf.data.experimental.AUTOTUNE))
-  if cache_dataset:
-    dataset = dataset.cache()
-  if is_training:
-    dataset = dataset.shuffle(buffer_size=10 * batch_size).repeat()
-
-  dataset = dataset.padded_batch(
-      batch_size,
-      dataset.output_shapes,
-      drop_remainder=True).prefetch(tf.data.experimental.AUTOTUNE)
-
-  return dataset
 
 
 class GrooveConverter(BaseNoteSequenceConverter):
@@ -1289,7 +1204,7 @@ class GrooveConverter(BaseNoteSequenceConverter):
   at a single timestep is of length 9x3 = 27. So a single measure of drums
   at a 16th note grid is a matrix of shape (16, 27).
 
-  Args:
+  Attributes:
     split_bars: Optional size of window to slide over full converted tensor.
     steps_per_quarter: The number of quantization steps per quarter note.
     quarters_per_bar: The number of quarter notes per bar.
@@ -1416,7 +1331,7 @@ class GrooveConverter(BaseNoteSequenceConverter):
     return self._pitch_classes
 
   @property
-  def pitch_class_map(self):
+  def pitch_class_map(self):  # pylint: disable=g-missing-from-attributes
     if self.is_inferring:
       return self._infer_pitch_class_map
     return self._pitch_class_map
@@ -1469,7 +1384,7 @@ class GrooveConverter(BaseNoteSequenceConverter):
     else:
       raise ValueError('Unlisted feature: ' + feature)
 
-  def _to_tensors(self, note_sequence):
+  def to_tensors(self, note_sequence):
 
     def _get_steps_hash(note_sequence):
       """Partitions all Notes in a NoteSequence by quantization step and drum.
@@ -1487,7 +1402,7 @@ class GrooveConverter(BaseNoteSequenceConverter):
       Raises:
         ValueError: If the sequence is not quantized
       """
-      if not mm.sequences_lib.is_quantized_sequence(note_sequence):
+      if not note_seq.sequences_lib.is_quantized_sequence(note_sequence):
         raise ValueError('NoteSequence must be quantized')
 
       h = collections.defaultdict(lambda: collections.defaultdict(list))
@@ -1520,14 +1435,14 @@ class GrooveConverter(BaseNoteSequenceConverter):
     try:
       quantized_sequence = sequences_lib.quantize_note_sequence(
           note_sequence, self._steps_per_quarter)
-      if (mm.steps_per_bar_in_quantized_sequence(quantized_sequence) !=
+      if (note_seq.steps_per_bar_in_quantized_sequence(quantized_sequence) !=
           self._steps_per_bar):
         return ConverterTensors()
       if not quantized_sequence.time_signatures:
         quantized_sequence.time_signatures.add(numerator=4, denominator=4)
-    except (mm.BadTimeSignatureError, mm.NonIntegerStepsPerBarError,
-            mm.NegativeTimeError, mm.MultipleTimeSignatureError,
-            mm.MultipleTempoError):
+    except (note_seq.BadTimeSignatureError, note_seq.NonIntegerStepsPerBarError,
+            note_seq.NegativeTimeError, note_seq.MultipleTimeSignatureError,
+            note_seq.MultipleTempoError):
       return ConverterTensors()
 
     beat_length = 60. / quantized_sequence.tempos[0].qpm
@@ -1670,7 +1585,7 @@ class GrooveConverter(BaseNoteSequenceConverter):
 
     return ConverterTensors(inputs=input_seqs, outputs=seqs, controls=controls)
 
-  def _to_notesequences(self, samples, controls=None):
+  def from_tensors(self, samples, controls=None):
 
     def _zero_one_to_velocity(val):
       output = int(np.round(val*127))
@@ -1692,7 +1607,7 @@ class GrooveConverter(BaseNoteSequenceConverter):
       n_timesteps = (sample.shape[0] // (
           self._num_drums if self._categorical_outputs else 1))
 
-      note_sequence = music_pb2.NoteSequence()
+      note_sequence = note_seq.NoteSequence()
       note_sequence.tempos.add(qpm=120)
       beat_length = 60. / note_sequence.tempos[0].qpm
       step_length = beat_length / self._steps_per_quarter
@@ -1745,3 +1660,207 @@ class GrooveConverter(BaseNoteSequenceConverter):
       output_sequences.append(note_sequence)
 
     return output_sequences
+
+
+def count_examples(examples_path, tfds_name, data_converter,
+                   file_reader=tf.python_io.tf_record_iterator):
+  """Counts the number of examples produced by the converter from files."""
+  def _file_generator():
+    filenames = tf.gfile.Glob(examples_path)
+    for f in filenames:
+      tf.logging.info('Counting examples in %s.', f)
+      reader = file_reader(f)
+      for item_str in reader:
+        yield data_converter.str_to_item_fn(item_str)
+
+  def _tfds_generator():
+    ds = tfds.as_numpy(
+        tfds.load(tfds_name, split=tfds.Split.VALIDATION, try_gcs=True))
+    # TODO(adarob): Generalize to other data types if needed.
+    for ex in ds:
+      yield note_seq.midi_to_note_sequence(ex['midi'])
+
+  num_examples = 0
+
+  generator = _tfds_generator if tfds_name else _file_generator
+  for item in generator():
+    tensors = data_converter.to_tensors(item)
+    num_examples += len(tensors.inputs)
+  tf.logging.info('Total examples: %d', num_examples)
+  return num_examples
+
+
+def split_process_and_combine(note_sequence, split, sample_size, randomize,
+                              to_tensors_fn):
+  """Splits a `NoteSequence`, processes and combines the `ConverterTensors`.
+
+  Args:
+    note_sequence: The `NoteSequence` to split, process and combine.
+    split: If True, the given note_sequence is split into multiple based on time
+      changes, and the tensor outputs are concatenated.
+    sample_size: Outputs are sampled if size exceeds this value.
+    randomize: If True, outputs are randomly sampled (this is generally done
+      during training).
+    to_tensors_fn: A fn that converts a `NoteSequence` to `ConverterTensors`.
+
+  Returns:
+    A `ConverterTensors` obj.
+  """
+  note_sequences = sequences_lib.split_note_sequence_on_time_changes(
+      note_sequence) if split else [note_sequence]
+  results = []
+  for ns in note_sequences:
+    tensors = to_tensors_fn(ns)
+    sampled_results = maybe_sample_items(
+        list(zip(*tensors)), sample_size, randomize)
+    if sampled_results:
+      results.append(ConverterTensors(*zip(*sampled_results)))
+    else:
+      results.append(ConverterTensors())
+  return combine_converter_tensors(results, sample_size, randomize)
+
+
+def convert_to_tensors_op(item_scalar, converter):
+  """TensorFlow op that converts item into output tensors.
+
+  Sequences will be padded to match the length of the longest.
+
+  Args:
+    item_scalar: A scalar of type tf.String containing the raw item to be
+      converted to tensors.
+    converter: The DataConverter to be used.
+
+  Returns:
+    inputs: A Tensor, shaped [num encoded seqs, max(lengths), input_depth],
+        containing the padded input encodings.
+    outputs: A Tensor, shaped [num encoded seqs, max(lengths), output_depth],
+        containing the padded output encodings resulting from the input.
+    controls: A Tensor, shaped
+        [num encoded seqs, max(lengths), control_depth], containing the padded
+        control encodings.
+    lengths: A tf.int32 Tensor, shaped [num encoded seqs], containing the
+      unpadded lengths of the tensor sequences resulting from the input.
+  """
+
+  def _convert_and_pad(item_str):
+    item = converter.str_to_item_fn(item_str.numpy())  # pylint:disable=not-callable
+    tensors = converter.to_tensors(item)
+    inputs = _maybe_pad_seqs(tensors.inputs, converter.input_dtype,
+                             converter.input_depth)
+    outputs = _maybe_pad_seqs(tensors.outputs, converter.output_dtype,
+                              converter.output_depth)
+    controls = _maybe_pad_seqs(tensors.controls, converter.control_dtype,
+                               converter.control_depth)
+    return inputs, outputs, controls, np.array(tensors.lengths, np.int32)
+
+  inputs, outputs, controls, lengths = tf.py_function(
+      _convert_and_pad,
+      inp=[item_scalar],
+      Tout=[
+          converter.input_dtype, converter.output_dtype,
+          converter.control_dtype, tf.int32
+      ],
+      name='convert_and_pad')
+  inputs.set_shape([None, None, converter.input_depth])
+  outputs.set_shape([None, None, converter.output_depth])
+  controls.set_shape([None, None, converter.control_depth])
+  lengths.set_shape([None] + list(converter.length_shape))
+  return inputs, outputs, controls, lengths
+
+
+def get_dataset(
+    config,
+    tf_file_reader=tf.data.TFRecordDataset,
+    is_training=False,
+    cache_dataset=True):
+  """Get input tensors from dataset for training or evaluation.
+
+  Args:
+    config: A Config object containing dataset information.
+    tf_file_reader: The tf.data.Dataset class to use for reading files.
+    is_training: Whether or not the dataset is used in training. Determines
+      whether dataset is shuffled and repeated, etc.
+    cache_dataset: Whether to cache the dataset in memory for improved
+      performance.
+
+  Returns:
+    A tf.data.Dataset containing input, output, control, and length tensors.
+
+  Raises:
+    ValueError: If no files match examples path.
+  """
+  batch_size = config.hparams.batch_size
+  examples_path = (
+      config.train_examples_path if is_training else config.eval_examples_path)
+  note_sequence_augmenter = (
+      config.note_sequence_augmenter if is_training else None)
+  data_converter = config.data_converter
+  data_converter.set_mode('train' if is_training else 'eval')
+
+  if examples_path:
+    tf.logging.info('Reading examples from file: %s', examples_path)
+    num_files = len(tf.gfile.Glob(examples_path))
+    if not num_files:
+      raise ValueError(
+          'No files were found matching examples path: %s' %  examples_path)
+    files = tf.data.Dataset.list_files(examples_path)
+    dataset = files.interleave(
+        tf_file_reader,
+        cycle_length=tf.data.experimental.AUTOTUNE,
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    # Use instead of `deterministic` kwarg for backward compatibility.
+    options = tf.data.Options()
+    options.experimental_deterministic = not is_training
+    dataset = dataset.with_options(options)
+  elif config.tfds_name:
+    tf.logging.info('Reading examples from TFDS: %s', config.tfds_name)
+    dataset = tfds.load(
+        config.tfds_name,
+        split=tfds.Split.TRAIN if is_training else tfds.Split.VALIDATION,
+        shuffle_files=is_training,
+        try_gcs=True)
+    def _tf_midi_to_note_sequence(ex):
+      return tf.py_function(
+          lambda x:  # pylint:disable=g-long-lambda
+          [note_seq.midi_to_note_sequence(x.numpy()).SerializeToString()],
+          inp=[ex['midi']],
+          Tout=tf.string,
+          name='midi_to_note_sequence')
+    dataset = dataset.map(
+        _tf_midi_to_note_sequence,
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  else:
+    raise ValueError(
+        'One of `config.examples_path` or `config.tfds_name` must be defined.')
+
+  def _remove_pad_fn(padded_seq_1, padded_seq_2, padded_seq_3, length):
+    if length.shape.ndims == 0:
+      return (padded_seq_1[0:length], padded_seq_2[0:length],
+              padded_seq_3[0:length], length)
+    else:
+      # Don't remove padding for hierarchical examples.
+      return padded_seq_1, padded_seq_2, padded_seq_3, length
+
+  if note_sequence_augmenter is not None:
+    dataset = dataset.map(
+        note_sequence_augmenter.tf_augment,
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
+
+  dataset = dataset.map(
+      tf.autograph.experimental.do_not_convert(
+          functools.partial(convert_to_tensors_op, converter=data_converter)),
+      num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  dataset = dataset.unbatch()
+  dataset = dataset.map(
+      _remove_pad_fn, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  if cache_dataset:
+    dataset = dataset.cache()
+  if is_training:
+    dataset = dataset.shuffle(buffer_size=10 * batch_size).repeat()
+
+  dataset = dataset.padded_batch(
+      batch_size,
+      tf.data.get_output_shapes(dataset),
+      drop_remainder=True).prefetch(tf.data.experimental.AUTOTUNE)
+
+  return dataset
